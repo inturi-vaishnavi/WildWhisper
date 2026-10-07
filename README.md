@@ -1,113 +1,148 @@
-# Hands-Free Trail Naturalist
+# WildWhisper
 
-A lightweight, voice-first naturalist assistant for the Hacktoberfest 2026
-**Touch Grass** challenge. Give it a trail photo and a question; local Gemma
-inference describes what it sees, and the answer is spoken aloud. Use typed
-questions or optional local voice dictation, so you can keep your attention on
-the trail rather than a screen.
+WildWhisper is a hands-free trail naturalist assistant. Give it a trail photo
+and a question, then get a concise spoken answer from a local vision model
+through Ollama. Ask by typing or, optionally, dictate your question with local
+Vosk speech recognition.
 
-## How it works
+## Features
 
-1. Optional voice input is recorded from the microphone and transcribed locally
-   by Vosk. Text questions can be passed directly on the command line.
-2. The photo and question are sent to the local Ollama `gemma2:2b` model.
-3. When an ElevenLabs API key is configured, its SDK synthesizes an MP3 response
-   saved as `trail_response.mp3`. Without a key, the app uses the system's
-   offline speech engine instead.
-4.    MP3 playback uses `afplay` on macOS and `mpg123`/`ffplay` on Linux (or `ffmpeg`
-   piped to `aplay`). Local fallback speech uses macOS `say`, Windows Speech, or
-   Linux `espeak-ng`/`espeak`.
-5. Sentry SDK agent tracing records pipeline timing when `SENTRY_DSN` is set.
+- Analyzes a photo and question with a vision-capable Ollama model. The default
+  model is `llava`.
+- Accepts typed questions or optional offline voice input with Vosk.
+- Speaks answers using ElevenLabs when configured, with a local text-to-speech
+  fallback.
+- Saves ElevenLabs audio as `trail_response.mp3` and plays it with the host
+  operating system's audio player.
+- Optionally records application tracing and errors with Sentry.
 
-Gemma, Vosk, and local system speech keep core recognition, inference, and
-fallback narration on-device. ElevenLabs synthesis and Sentry reporting are
-optional online services. For the most offline use, omit the ElevenLabs API key
-and Sentry DSN.
+Image analysis and optional voice transcription run locally. If enabled,
+ElevenLabs receives the generated answer text for speech synthesis, and Sentry
+receives telemetry. Omit `ELEVENLABS_API_KEY` and `SENTRY_DSN` to avoid those
+optional online services.
+
+## Project files
+
+| Path | Description |
+| --- | --- |
+| `app.py` | Command-line application and audio/inference pipeline |
+| `requirements.txt` | Core Python dependencies |
+| `sample/trail.jpg` | Example photo for trying the application |
+| `.gitignore` | Ignores virtual environments, caches, and generated audio |
+| `LICENSE` | MIT License |
 
 ## Requirements
 
 - Python 3.10 or later
-- [Ollama](https://ollama.com/) with `gemma2:2b`
-- Microphone and a downloaded Vosk model for `--listen` voice input
-- `afplay` (macOS), `mpg123` or `ffplay` (Linux) for ElevenLabs MP3 playback;
-  alternatively, Linux can use `ffmpeg` piped to `aplay`
-- Linux local voice fallback: `espeak-ng` or `espeak`
-- Optional: ElevenLabs API key for MP3 synthesis
-- Optional: Sentry DSN for remote tracing
+- [Ollama](https://ollama.com/) with a vision-capable model
+- A microphone and the optional Vosk model for voice input
+- Optional: ElevenLabs API key for online audio synthesis
+- Optional: Sentry DSN for remote tracing and error reporting
+- For local speech fallback:
+  - macOS: built-in `say`
+  - Windows: Windows Speech via PowerShell
+  - Linux: `espeak-ng` or `espeak`
+- For ElevenLabs MP3 playback:
+  - macOS: `afplay`
+  - Windows: the default application for MP3 files
+  - Linux: `ffmpeg` and `aplay`, or `mpg123` or `ffplay`
 
-## Install
+## Installation
 
-### 1. Install Ollama and pull Gemma
+### 1. Install Ollama and a vision model
 
-Install Ollama from [ollama.com](https://ollama.com/), start it, then pull the
-local vision model:
+Install and start Ollama, then download the default model:
 
 ```bash
-ollama pull gemma2:2b
+ollama pull llava
 ```
 
-### 2. Install Python packages
+To use another vision-capable Ollama model, set `OLLAMA_MODEL` as described
+under [Configuration](#configuration).
 
-From the project directory:
+### 2. Set up Python
+
+Create and activate a virtual environment from the project directory:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+On macOS or Linux, activate it with:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+Install the application dependencies:
 
 ```bash
 python -m pip install -r requirements.txt
 ```
 
-### 3. (Optional) Set up offline voice input
+### 3. (Optional) Enable voice input
 
-Download and unpack the small English Vosk model into
-`models/vosk-model-small-en-us-0.15`. The model is available from the
-[Vosk model downloads](https://alphacephei.com/vosk/models) page. Alternatively,
-set `VOSK_MODEL_PATH` to the path of another compatible unpacked model.
-
-### 4. (Optional) Configure ElevenLabs and Sentry
-
-Without `ELEVENLABS_API_KEY`, speech is spoken locally rather than sent to
-ElevenLabs. To enable ElevenLabs MP3 synthesis, set the key:
+Install Vosk:
 
 ```bash
-# macOS / Linux
-export ELEVENLABS_API_KEY="your-elevenlabs-api-key"
-export SENTRY_DSN="https://your-sentry-dsn" # optional
+python -m pip install vosk
 ```
+
+Download and unpack a small English Vosk model into
+`models/vosk-model-small-en-us-0.15`. The model is available from the
+[Vosk model downloads](https://alphacephei.com/vosk/models) page. To use a
+different unpacked model, set `VOSK_MODEL_PATH`. The microphone and
+`sounddevice` are also required.
+
+### 4. (Optional) Configure services
+
+Without `ELEVENLABS_API_KEY`, answers are spoken locally instead of being sent
+to ElevenLabs. Set the key to enable MP3 synthesis. Set `SENTRY_DSN` to enable
+optional tracing and error reporting.
 
 ```powershell
 # Windows PowerShell
 $env:ELEVENLABS_API_KEY = "your-elevenlabs-api-key"
-$env:SENTRY_DSN = "https://your-sentry-dsn" # optional
+$env:SENTRY_DSN = "https://your-sentry-dsn"
 ```
 
-Sentry tracing is enabled only when a DSN is configured. The application avoids
-sending default personally identifiable data.
+```bash
+# macOS / Linux
+export ELEVENLABS_API_KEY="your-elevenlabs-api-key"
+export SENTRY_DSN="https://your-sentry-dsn"
+```
+
+Sentry is disabled when no DSN is configured. The application disables Sentry's
+default personally identifiable data collection.
 
 ## Run
 
-Ensure Ollama is running, then provide a photo and a typed question:
+Make sure Ollama is running and ask about the included sample photo:
 
 ```bash
-python app.py sample_photos/trail.jpg "Is this plant safe to touch?"
+python app.py sample/trail.jpg "What animal is in this photo?"
 ```
 
-To dictate the question instead (Vosk listens for up to eight seconds):
+For local voice dictation (listens for up to eight seconds):
 
 ```bash
-python app.py sample_photos/trail.jpg --listen
+python app.py sample/trail.jpg --listen
 ```
 
-The Gemma response is requested in two concise sentences. Local inference
-failures trigger a polite spoken message using the system speech engine. If
-ElevenLabs is unavailable, a successful Gemma answer is spoken locally instead.
-On macOS the local `say` command is built in; on Linux, install `espeak-ng` or
-`espeak` for offline narration.
+Pass either a question or `--listen`, not both. Answers are requested in no
+more than two short sentences. If local inference fails, the app reports the
+problem and tries to speak a fallback message. If ElevenLabs synthesis or
+playback fails, it falls back to local speech or prints the answer.
 
 ## Configuration
 
 | Environment variable | Default | Purpose |
 | --- | --- | --- |
 | `OLLAMA_URL` | `http://localhost:11434` | Local Ollama base URL |
-| `OLLAMA_MODEL` | `gemma2:2b` | Ollama model name |
-| `ELEVENLABS_API_KEY` | Unset | Enables online ElevenLabs MP3 synthesis |
+| `OLLAMA_MODEL` | `llava` | Vision-capable Ollama model name |
+| `ELEVENLABS_API_KEY` | Unset | Enables ElevenLabs MP3 synthesis |
 | `ELEVENLABS_VOICE_ID` | `21m00Tcm4TlvDq8ikWAM` | ElevenLabs voice |
 | `VOSK_MODEL_PATH` | `models/vosk-model-small-en-us-0.15` | Unpacked offline transcription model |
 | `SENTRY_DSN` | Unset | Enables Sentry tracing and error reporting |
