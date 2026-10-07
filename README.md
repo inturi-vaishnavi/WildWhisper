@@ -99,23 +99,30 @@ different unpacked model, set `VOSK_MODEL_PATH`. The microphone and
 ### 4. (Optional) Configure services
 
 Without `ELEVENLABS_API_KEY`, answers are spoken locally instead of being sent
-to ElevenLabs. Set the key to enable MP3 synthesis. Set `SENTRY_DSN` to enable
-optional tracing and error reporting.
+to ElevenLabs. Set the key to enable MP3 synthesis. To enable Sentry tracing
+and error reporting, replace the placeholder in the project-root `.env` file
+with your Sentry project DSN:
+
+```dotenv
+SENTRY_DSN=YOUR_SENTRY_DSN_HERE
+```
+
+The application loads `.env` at startup. Keep your actual DSN private; `.env`
+is ignored by Git.
 
 ```powershell
 # Windows PowerShell
 $env:ELEVENLABS_API_KEY = "your-elevenlabs-api-key"
-$env:SENTRY_DSN = "https://your-sentry-dsn"
 ```
 
 ```bash
 # macOS / Linux
 export ELEVENLABS_API_KEY="your-elevenlabs-api-key"
-export SENTRY_DSN="https://your-sentry-dsn"
 ```
 
-Sentry is disabled when no DSN is configured. The application disables Sentry's
-default personally identifiable data collection.
+Sentry is initialized when a DSN is configured. Tracing samples all transactions
+(`traces_sample_rate=1.0`), and default personally identifiable data collection
+is disabled.
 
 ## Run
 

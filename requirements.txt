@@ -1,4 +1,5 @@
 requests>=2.31.0
 elevenlabs>=1.0.0
+python-dotenv>=1.0.0
 sentry-sdk>=2.0.0
 sounddevice>=0.4.6

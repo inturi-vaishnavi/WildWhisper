@@ -13,7 +13,10 @@ from pathlib import Path
 from typing import Any, Generator
 
 import requests
+from dotenv import load_dotenv
 from elevenlabs.client import ElevenLabs
+
+load_dotenv()
 
 try:
     import sentry_sdk
@@ -33,7 +36,7 @@ FALLBACK_MESSAGE = (
     "Sorry, I couldn't get an answer from the local nature model. "
     "Please try again when the model is available."
 )
-SENTRY_ENABLED = False
+SENTRY_ENABLED = True
 
 
 @contextmanager
