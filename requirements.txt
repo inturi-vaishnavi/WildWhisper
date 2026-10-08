@@ -3,3 +3,5 @@ elevenlabs>=1.0.0
 python-dotenv>=1.0.0
 sentry-sdk>=2.0.0
 sounddevice>=0.4.6
+vosk>=0.3.45
+numpy>=1.26.0
