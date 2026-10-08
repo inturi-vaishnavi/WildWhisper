@@ -30,8 +30,8 @@ htmlcov/
 # Generated audio
 trail_response.mp3
 
-# Downloaded speech recognition model
-models/vosk-model-small-en-us-0.15/
+# Downloaded local AI/speech models
+models/
 
 # IDE/editor temporary files
 .idea/

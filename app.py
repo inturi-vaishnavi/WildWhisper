@@ -5,6 +5,7 @@ import base64
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -26,7 +27,7 @@ except ImportError:
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
 # Gemma 2 models are text-only; Gemma 3 4B accepts images through Ollama.
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llava")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "moondream")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
 VOSK_MODEL_PATH = Path(
     os.getenv("VOSK_MODEL_PATH", "models/vosk-model-small-en-us-0.15")
@@ -35,6 +36,10 @@ OUTPUT_FILE = Path("trail_response.mp3")
 FALLBACK_MESSAGE = (
     "Sorry, I couldn't get an answer from the local nature model. "
     "Please try again when the model is available."
+)
+SAFETY_FALLBACK_MESSAGE = (
+    "I can't determine whether this is safe from the image alone. "
+    "Until the plant is reliably identified, avoid touching it."
 )
 SENTRY_ENABLED = True
 
@@ -147,36 +152,41 @@ def listen_for_question(seconds: int = 8) -> str:
     return question
 
 
+def is_safety_question(question: str) -> bool:
+    return re.search(
+        r"\b(?:safe|safety|touch\w*|toxic\w*|poison\w*|eat\w*|"
+        r"edible|danger\w*|harmful|approach\w*)\b",
+        question,
+        re.IGNORECASE,
+    ) is not None
+
+
+def asks_for_identification(question: str) -> bool:
+    return re.search(
+        r"\b(?:what\s+(?:type|kind|species|plant|tree|animal)|"
+        r"which\s+species|identify|name\s+(?:this|that)|"
+        r"what\s+(?:is|['’]s)\s+(?:this|that))\b",
+        question,
+        re.IGNORECASE,
+    ) is not None
+
+
 def ask_gemma(photo_path: Path, question: str) -> str:
     """Send a photo and safety-aware question to local Ollama inference."""
     image_data = base64.b64encode(photo_path.read_bytes()).decode("ascii")
-    prompt = (f"""
-You are WildWhisper, a helpful AI nature guide.
-
-Analyze the provided trail image carefully and answer the user's question directly. Do not simply describe the scene unless the user's question asks for a description.
+    prompt = f"""
+Look at the image carefully and answer the user's question.
 
 User question: {question}
 
-Rules:
-- Give a concise answer suitable for being spoken aloud.
-- Use no more than 2 short sentences.
-- Be clear, natural, and conversational.
-- Focus on the specific question rather than giving a generic image description.
-- When identification is requested, provide the most likely identification you can make from visible evidence, while clearly stating uncertainty.
-- Never identify a species with certainty unless the visible features strongly support the identification.
-- If the image is too distant or lacks identifying features, say that the species cannot be reliably determined.
-- Never say that a tree is not a plant.
-- Do not invent details that cannot be determined from the image.
-- For questions about whether a plant or animal is safe to touch, eat, approach, or interact with, never determine safety from appearance alone.
-- Never say that a wild plant is safe to touch or eat unless reliable identification and safety information are available.
-- If the species cannot be reliably identified from the image, clearly say that safety cannot be determined from the image and recommend avoiding contact.
-- Do not use "healthy appearance", "green leaves", "no visible harm", or similar visual characteristics as evidence that a plant is safe.
-- When the user asks a safety-related question, prioritize caution over reassurance.
-- Do not mention that you are an AI.
-- Do not use bullet points, headings, or markdown.
+Answer the question directly in one or two short sentences.
+Do not talk about WildWhisper, AI, the model, or yourself.
+Do not simply give a generic description unless the user's question asks for a description.
+If you cannot identify something reliably, say so.
+For safety questions about plants or animals, do not claim something is safe based only on appearance. If it cannot be reliably identified, recommend avoiding contact.
 
-Answer the question directly.
-""")
+Answer:
+"""
 
     with sentry_span(op="gen_ai.chat", name="ollama.generate"):
         response = requests.post(
@@ -186,16 +196,44 @@ Answer the question directly.
                 "prompt": prompt,
                 "images": [image_data],
                 "stream": False,
+                "options": {
+                    "num_predict": 40,
+                    "temperature": 0.2
+                },  
             },
-            timeout=(5, 180),
+            timeout=(5, 90),
         )
         response.raise_for_status()
         result = response.json()
 
     answer = result.get("response") if isinstance(result, dict) else None
     if not isinstance(answer, str) or not answer.strip():
-        raise RuntimeError("Ollama returned an empty or invalid response.")
-    return answer.strip()
+        capture_exception(
+            RuntimeError("Ollama returned an empty or invalid response.")
+        )
+        if is_safety_question(question):
+            return SAFETY_FALLBACK_MESSAGE
+        return FALLBACK_MESSAGE
+
+    answer = answer.strip()
+    if is_safety_question(question) and re.search(
+        r"\b(?:safe|harmless|non[- ]?toxic|edible)\b",
+        answer,
+        re.IGNORECASE,
+    ):
+        return SAFETY_FALLBACK_MESSAGE
+
+    if is_safety_question(question) and len(answer.split()) == 1:
+        return SAFETY_FALLBACK_MESSAGE
+
+    if asks_for_identification(question) and len(answer.split()) == 1:
+        identification = answer.strip(" \t\r\n.,!?;:")
+        if identification:
+            return (
+                f"This appears to be a {identification.lower()}, but I can't "
+                "reliably identify it more specifically from this image alone."
+            )
+    return answer
 
 
 def synthesize_speech(text: str) -> Path:
