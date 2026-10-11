@@ -45,6 +45,8 @@ is not completely offline when either cloud service is used.
 | `sample/trail.jpg` | Example photo for trying the application |
 | `.gitignore` | Ignores virtual environments, caches, generated audio, and local models |
 | `LICENSE` | MIT License |
+| `webapp.py` | Local Flask web interface that reuses the CLI backend |
+| `templates/` and `static/` | Web interface markup, styles, and JavaScript |
 
 The `models/` directory is for locally downloaded models and is ignored by Git;
 it is not a committed project directory.
@@ -157,6 +159,21 @@ Pass either a question or `--listen`, not both. Answers are requested in no
 more than two short sentences. If local inference fails, the app reports the
 problem and tries to speak a fallback message. If ElevenLabs synthesis or
 playback fails, it falls back to local speech or prints the answer.
+
+### Web interface
+
+Install the dependencies, start Ollama locally with Moondream available, then
+run the web interface from the project directory:
+
+```bash
+python webapp.py
+```
+
+Open `http://127.0.0.1:5000` in a browser on the same computer. The interface
+uses the existing local Ollama/Moondream pipeline and Vosk voice input; voice
+questions are recorded for up to eight seconds using the microphone connected
+to the computer running WildWhisper. ElevenLabs audio is played in the browser
+when configured; otherwise the existing local speech fallback is used.
 
 ## Limitations
 

@@ -3,6 +3,7 @@
 import argparse
 import base64
 import json
+import logging
 import os
 import platform
 import re
@@ -19,6 +20,8 @@ from elevenlabs.client import ElevenLabs
 
 load_dotenv()
 
+LOGGER = logging.getLogger(__name__)
+
 try:
     import sentry_sdk
 except ImportError:
@@ -32,6 +35,7 @@ ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
 VOSK_MODEL_PATH = Path(
     os.getenv("VOSK_MODEL_PATH", "models/vosk-model-small-en-us-0.15")
 )
+VOSK_SAMPLE_RATE = 16000
 OUTPUT_FILE = Path("trail_response.mp3")
 FALLBACK_MESSAGE = (
     "Sorry, I couldn't get an answer from the local nature model. "
@@ -39,7 +43,7 @@ FALLBACK_MESSAGE = (
 )
 SAFETY_FALLBACK_MESSAGE = (
     "I can't determine whether this is safe from the image alone. "
-    "Until the plant is reliably identified, avoid touching it."
+    "Until the plant is reliably identified, avoid touching or eating it."
 )
 SENTRY_ENABLED = True
 
@@ -117,8 +121,73 @@ def flush_sentry() -> None:
         pass
 
 
+def _prepare_vosk_audio(recording: Any, source_rate: int) -> bytes:
+    """Convert microphone samples to mono, 16-bit PCM at the Vosk model rate."""
+    import numpy as np
+
+    audio = np.asarray(recording)
+    if audio.dtype != np.dtype("int16") or audio.ndim not in (1, 2):
+        raise RuntimeError(
+            "The microphone returned an unsupported audio format. Check its configuration and try again."
+        )
+    if source_rate <= 0 or audio.shape[0] == 0:
+        raise RuntimeError(
+            "The microphone recording was incomplete. Please record your question again."
+        )
+
+    if audio.ndim == 2:
+        if audio.shape[1] < 1:
+            raise RuntimeError(
+                "The microphone recording did not contain an audio channel. Please try again."
+            )
+        channels = audio.astype(np.float64)
+        channel_levels = np.sqrt(np.mean(np.square(channels), axis=0))
+        audio = channels[:, int(np.argmax(channel_levels))]
+    else:
+        audio = audio.astype(np.float64)
+
+    clipped_samples = np.count_nonzero(np.abs(audio) >= 32760)
+    if clipped_samples / audio.size > 0.01:
+        raise RuntimeError(
+            "The microphone audio is clipping. Lower the input level or move farther from the microphone, then try again."
+        )
+
+    audio -= np.mean(audio)
+    if float(np.max(np.abs(audio))) < 256:
+        raise RuntimeError(
+            "The microphone input was too quiet. Check the input level, speak closer to the microphone, and try again."
+        )
+    if source_rate != VOSK_SAMPLE_RATE:
+        ratio = VOSK_SAMPLE_RATE / source_rate
+        cutoff = 0.475 * min(1.0, ratio)
+        half_width = 48
+        positions = np.arange(-half_width, half_width + 1, dtype=np.float64)
+        low_pass = 2 * cutoff * np.sinc(2 * cutoff * positions)
+        low_pass *= np.hamming(low_pass.size)
+        low_pass /= np.sum(low_pass)
+        filtered = np.convolve(audio, low_pass, mode="same")
+        output_length = round(audio.size * ratio)
+        output_positions = np.arange(output_length) / ratio
+        audio = np.interp(
+            output_positions,
+            np.arange(filtered.size),
+            filtered,
+            left=0.0,
+            right=0.0,
+        )
+
+    pcm = np.clip(np.rint(audio), -32768, 32767).astype("<i2", copy=False)
+    if pcm.size == 0:
+        raise RuntimeError(
+            "The microphone recording was incomplete. Please record your question again."
+        )
+    return pcm.tobytes()
+
+
 def listen_for_question(seconds: int = 8) -> str:
     """Record and transcribe a short question with an offline Vosk model."""
+    if seconds <= 0:
+        raise ValueError("The recording duration must be positive.")
     if not VOSK_MODEL_PATH.is_dir():
         raise RuntimeError(
             f"Vosk model not found at {VOSK_MODEL_PATH}. "
@@ -133,22 +202,81 @@ def listen_for_question(seconds: int = 8) -> str:
             "Voice input requires the sounddevice and vosk packages."
         ) from error
 
-    model = Model(str(VOSK_MODEL_PATH))
-    sample_rate = int(sd.query_devices(kind="input")["default_samplerate"])
-    print(f"Listening for your question for up to {seconds} seconds...")
-    recording = sd.rec(
-        int(seconds * sample_rate),
-        samplerate=sample_rate,
-        channels=1,
-        dtype="int16",
-    )
-    sd.wait()
+    try:
+        device = sd.query_devices(kind="input")
+    except sd.PortAudioError as error:
+        message = str(error).casefold()
+        if "permission" in message or "access denied" in message:
+            raise RuntimeError(
+                "Microphone permission was denied. Allow microphone access in your operating-system settings and try again."
+            ) from error
+        raise RuntimeError(
+            "No microphone input device is available. Connect a microphone and try again."
+        ) from error
 
-    recognizer = KaldiRecognizer(model, sample_rate)
-    recognizer.AcceptWaveform(recording.tobytes())
-    question = json.loads(recognizer.FinalResult()).get("text", "").strip()
+    if device["max_input_channels"] < 1:
+        raise RuntimeError(
+            "No microphone input device is available. Connect a microphone and try again."
+        )
+    source_rate = int(device["default_samplerate"])
+    if source_rate <= 0:
+        raise RuntimeError(
+            "The microphone reported an invalid sample rate. Check its configuration."
+        )
+    channels = 1
+    try:
+        sd.check_input_settings(
+            device=device["index"],
+            channels=channels,
+            dtype="int16",
+            samplerate=source_rate,
+        )
+    except sd.PortAudioError as error:
+        raise RuntimeError(
+            "The microphone does not support the required audio format. Check its configuration."
+        ) from error
+
+    print(f"Listening for your question for up to {seconds} seconds...")
+    try:
+        recording = sd.rec(
+            int(seconds * source_rate),
+            samplerate=source_rate,
+            channels=channels,
+            dtype="int16",
+        )
+        sd.wait()
+    except sd.PortAudioError as error:
+        message = str(error).casefold()
+        if "permission" in message or "access denied" in message:
+            raise RuntimeError(
+                "Microphone permission was denied. Allow microphone access in your operating-system settings and try again."
+            ) from error
+        raise RuntimeError(
+            "The microphone could not record audio. Check its connection and system permissions."
+        ) from error
+
+    expected_frames = int(seconds * source_rate)
+    if getattr(recording, "shape", (0,))[0] < expected_frames:
+        raise RuntimeError(
+            "The microphone recording was cut short. Please record your question again."
+        )
+    audio_bytes = _prepare_vosk_audio(recording, source_rate)
+
+    try:
+        model = Model(str(VOSK_MODEL_PATH))
+        recognizer = KaldiRecognizer(model, VOSK_SAMPLE_RATE)
+        recognizer.AcceptWaveform(audio_bytes)
+        result = json.loads(recognizer.FinalResult())
+    except (OSError, RuntimeError, ValueError, TypeError) as error:
+        raise RuntimeError(
+            "Local speech recognition failed. Check the Vosk model and try again."
+        ) from error
+
+    question = result.get("text", "").strip() if isinstance(result, dict) else ""
     if not question:
-        raise RuntimeError("No speech was recognized. Please try again.")
+        raise RuntimeError(
+            "No speech was recognized. Speak clearly near the microphone and try again."
+        )
     return question
 
 
@@ -171,67 +299,164 @@ def asks_for_identification(question: str) -> bool:
     ) is not None
 
 
+def _remove_positive_safety_claims(answer: str) -> str:
+    """Remove unsupported safety assurances while retaining visual observations."""
+    claim_pattern = re.compile(
+        r"\b(?:(?:is|are|looks?|seems?|appears?|may be|might be|could be|should be)\s+)?"
+        r"(?:to be\s+)?(?:safe|harmless|non[- ]?toxic|edible)"
+        r"(?:\s+to\s+(?:touch|eat|consume))?\b",
+        re.IGNORECASE,
+    )
+    denial_pattern = re.compile(
+        r"\b(?:not|never|cannot|can't|unable|uncertain|unsure|unknown|don't|do not)\b"
+        r"(?:\s+\w+){0,5}\s*$",
+        re.IGNORECASE,
+    )
+
+    cleaned_sentences = []
+    for sentence in re.split(r"(?<=[.!?])\s+", answer):
+        def remove_claim(match: re.Match[str]) -> str:
+            prefix = re.split(
+                r"\b(?:but|and|however)\b",
+                sentence[:match.start()],
+                flags=re.IGNORECASE,
+            )[-1]
+            return match.group(0) if denial_pattern.search(prefix) else ""
+
+        cleaned = claim_pattern.sub(remove_claim, sentence)
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        cleaned = re.sub(r"\s+([,.;!?])", r"\1", cleaned)
+        cleaned = re.sub(
+            r"\s*,?\s*\b(?:but|and|however)"
+            r"(?:\s+(?:it|they|this|these|those))?\s*[.!?;,:]*$",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = cleaned.strip(" \t\r\n,;:-")
+        if cleaned and not re.fullmatch(
+            r"(?:it|this|that|they|these|those|the plant|the leaves)[.!?]*",
+            cleaned,
+            re.IGNORECASE,
+        ):
+            cleaned_sentences.append(cleaned)
+
+    return " ".join(cleaned_sentences)
+
+
 def ask_gemma(photo_path: Path, question: str) -> str:
     """Send a photo and safety-aware question to local Ollama inference."""
     image_data = base64.b64encode(photo_path.read_bytes()).decode("ascii")
     prompt = f"""
-Look at the image carefully and answer the user's question.
+Inspect the image carefully before answering the user's question.
 
 User question: {question}
 
-Answer the question directly in one or two short sentences.
+If leaves are visible, first describe their observable shape, color, edges, arrangement, and texture, but only when those details are clear in the image. Then give a tentative identification only if the visible evidence supports one. Clearly state uncertainty when the image does not support a reliable identification.
+Answer the user's question directly in two or three short sentences. Describe only details that are visible.
 Do not talk about WildWhisper, AI, the model, or yourself.
-Do not simply give a generic description unless the user's question asks for a description.
-If you cannot identify something reliably, say so.
-For safety questions about plants or animals, do not claim something is safe based only on appearance. If it cannot be reliably identified, recommend avoiding contact.
+For safety questions, never say a plant or animal is safe, harmless, non-toxic, or edible based on appearance. Do not give a safety verdict; the application will add a caution.
 
 Answer:
 """
 
-    with sentry_span(op="gen_ai.chat", name="ollama.generate"):
-        response = requests.post(
-            f"{OLLAMA_URL}/api/generate",
-            json={
-                "model": OLLAMA_MODEL,
-                "prompt": prompt,
-                "images": [image_data],
-                "stream": False,
-                "options": {
-                    "num_predict": 40,
-                    "temperature": 0.2
-                },  
-            },
-            timeout=(5, 90),
+    LOGGER.warning("Ollama diagnostic: request started (model=%s)", OLLAMA_MODEL)
+    try:
+        with sentry_span(op="gen_ai.chat", name="ollama.generate"):
+            response = requests.post(
+                f"{OLLAMA_URL}/api/generate",
+                json={
+                    "model": OLLAMA_MODEL,
+                    "prompt": prompt,
+                    "images": [image_data],
+                    "stream": False,
+                    "options": {
+                        "num_predict": 100,
+                        "temperature": 0.2
+                    },
+                },
+                timeout=(5, 90),
+            )
+    except requests.RequestException as error:
+        LOGGER.warning(
+            "Ollama diagnostic: request failed (model=%s, error=%s)",
+            OLLAMA_MODEL,
+            type(error).__name__,
         )
+        raise
+
+    LOGGER.warning(
+        "Ollama diagnostic: HTTP response received (model=%s, status=%s)",
+        OLLAMA_MODEL,
+        response.status_code,
+    )
+    try:
         response.raise_for_status()
         result = response.json()
+    except (requests.RequestException, ValueError) as error:
+        LOGGER.warning(
+            "Ollama diagnostic: response could not be read (model=%s, status=%s, error=%s)",
+            OLLAMA_MODEL,
+            response.status_code,
+            type(error).__name__,
+        )
+        raise
 
     answer = result.get("response") if isinstance(result, dict) else None
-    if not isinstance(answer, str) or not answer.strip():
+    has_response = isinstance(answer, str) and bool(answer.strip())
+    LOGGER.warning(
+        "Ollama diagnostic: response text available (model=%s, non_empty=%s)",
+        OLLAMA_MODEL,
+        has_response,
+    )
+    if not has_response:
         capture_exception(
             RuntimeError("Ollama returned an empty or invalid response.")
         )
         if is_safety_question(question):
+            LOGGER.warning("Ollama diagnostic: response replaced with safety fallback")
             return SAFETY_FALLBACK_MESSAGE
+        LOGGER.warning("Ollama diagnostic: response replaced with generic fallback")
         return FALLBACK_MESSAGE
 
-    answer = answer.strip()
-    if is_safety_question(question) and re.search(
-        r"\b(?:safe|harmless|non[- ]?toxic|edible)\b",
-        answer,
-        re.IGNORECASE,
-    ):
-        return SAFETY_FALLBACK_MESSAGE
-
-    if is_safety_question(question) and len(answer.split()) == 1:
-        return SAFETY_FALLBACK_MESSAGE
+    cleaned_answer = answer.strip()
+    if cleaned_answer != answer:
+        LOGGER.warning("Ollama diagnostic: response trimmed surrounding whitespace")
+    answer = cleaned_answer
+    if is_safety_question(question):
+        filtered_answer = _remove_positive_safety_claims(answer)
+        if filtered_answer != answer:
+            LOGGER.warning("Ollama diagnostic: positive safety claims removed")
+        answer = filtered_answer
+        if not answer:
+            LOGGER.warning(
+                "Ollama diagnostic: safety-only response replaced with safety fallback"
+            )
+            return SAFETY_FALLBACK_MESSAGE
+        warned_answer = re.sub(
+            r"\bavoid touching it\b",
+            "avoid touching or eating it",
+            answer,
+            flags=re.IGNORECASE,
+        )
+        if warned_answer != answer:
+            LOGGER.warning("Ollama diagnostic: contact warning strengthened")
+        answer = warned_answer
+        if SAFETY_FALLBACK_MESSAGE.casefold() not in answer.casefold():
+            answer = answer.rstrip(" \t\r\n.,;:!?")
+            answer = f"{answer}. {SAFETY_FALLBACK_MESSAGE}"
+            LOGGER.warning("Ollama diagnostic: plant safety warning appended")
+        return answer
 
     if asks_for_identification(question) and len(answer.split()) == 1:
         identification = answer.strip(" \t\r\n.,!?;:")
         if identification:
+            LOGGER.warning(
+                "Ollama diagnostic: one-word identification expanded (model_text=one_word)"
+            )
             return (
-                f"This appears to be a {identification.lower()}, but I can't "
-                "reliably identify it more specifically from this image alone."
+                f"The image appears to show a {identification.lower()}, but "
+                "there isn't enough detail to identify it more specifically."
             )
     return answer
 
