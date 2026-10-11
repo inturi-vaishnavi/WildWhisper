@@ -36,6 +36,7 @@ VOSK_MODEL_PATH = Path(
     os.getenv("VOSK_MODEL_PATH", "models/vosk-model-small-en-us-0.15")
 )
 VOSK_SAMPLE_RATE = 16000
+VOSK_LOW_CONFIDENCE_THRESHOLD = 0.5
 OUTPUT_FILE = Path("trail_response.mp3")
 FALLBACK_MESSAGE = (
     "Sorry, I couldn't get an answer from the local nature model. "
@@ -184,8 +185,8 @@ def _prepare_vosk_audio(recording: Any, source_rate: int) -> bytes:
     return pcm.tobytes()
 
 
-def listen_for_question(seconds: int = 8) -> str:
-    """Record and transcribe a short question with an offline Vosk model."""
+def listen_for_question_with_confidence(seconds: int = 8) -> tuple[str, bool]:
+    """Return a Vosk transcript and whether any reported word is low-confidence."""
     if seconds <= 0:
         raise ValueError("The recording duration must be positive.")
     if not VOSK_MODEL_PATH.is_dir():
@@ -265,6 +266,7 @@ def listen_for_question(seconds: int = 8) -> str:
     try:
         model = Model(str(VOSK_MODEL_PATH))
         recognizer = KaldiRecognizer(model, VOSK_SAMPLE_RATE)
+        recognizer.SetWords(True)
         recognizer.AcceptWaveform(audio_bytes)
         result = json.loads(recognizer.FinalResult())
     except (OSError, RuntimeError, ValueError, TypeError) as error:
@@ -277,6 +279,19 @@ def listen_for_question(seconds: int = 8) -> str:
         raise RuntimeError(
             "No speech was recognized. Speak clearly near the microphone and try again."
         )
+    words = result.get("result", []) if isinstance(result, dict) else []
+    low_confidence = any(
+        isinstance(word, dict)
+        and isinstance(word.get("conf"), (int, float))
+        and word["conf"] < VOSK_LOW_CONFIDENCE_THRESHOLD
+        for word in words
+    )
+    return question, low_confidence
+
+
+def listen_for_question(seconds: int = 8) -> str:
+    """Record and transcribe a short question with an offline Vosk model."""
+    question, _ = listen_for_question_with_confidence(seconds)
     return question
 
 

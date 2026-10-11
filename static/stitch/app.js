@@ -531,7 +531,11 @@
         questionInput.dispatchEvent(new Event("input", { bubbles: true }));
       }
       if (transcript) transcript.textContent = `“${recognizedQuestion}”`;
-      if (voiceStatus) voiceStatus.textContent = "Review or record again";
+      if (voiceStatus) {
+        voiceStatus.textContent = data.low_confidence === true
+          ? "Review uncertain words or retry"
+          : "Review or record again";
+      }
       if (mic) mic.setAttribute("aria-label", "Record your question again");
     } catch (error) {
       if (voiceStatus) voiceStatus.textContent = "Ready to retry";

@@ -150,7 +150,9 @@ def create_app() -> Flask:
                 error="The local Vosk voice model is not installed. Follow the voice setup instructions first."
             ), 503
         try:
-            question = wildwhisper.listen_for_question(seconds=8)
+            question, low_confidence = (
+                wildwhisper.listen_for_question_with_confidence(seconds=8)
+            )
         except RuntimeError as error:
             wildwhisper.capture_exception(error)
             message = str(error)
@@ -198,7 +200,7 @@ def create_app() -> Flask:
             return jsonify(
                 error="No speech was recognized. Try again in a quieter place."
             ), 400
-        return jsonify(question=question.strip())
+        return jsonify(question=question.strip(), low_confidence=low_confidence)
 
     @web.post("/api/ask")
     def ask():

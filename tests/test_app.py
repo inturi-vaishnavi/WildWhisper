@@ -1,4 +1,5 @@
 from io import BytesIO
+from html.parser import HTMLParser
 import json
 import sys
 import tempfile
@@ -11,6 +12,20 @@ import numpy as np
 
 import app
 import webapp
+
+
+class VoiceInputParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.question_input = None
+        self.continue_button = None
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        if tag == "textarea" and attributes.get("id") == "voice-question-input":
+            self.question_input = attributes
+        elif tag == "button" and attributes.get("id") == "finishButton":
+            self.continue_button = attributes
 
 
 class AskGemmaTests(unittest.TestCase):
@@ -262,7 +277,14 @@ class ListenForQuestionTests(unittest.TestCase):
 
         self.recognizer = Mock()
         self.recognizer.FinalResult.return_value = json.dumps(
-            {"text": "identify this leaf"}
+            {
+                "text": "identify this leaf",
+                "result": [
+                    {"word": "identify", "conf": 0.95},
+                    {"word": "this", "conf": 0.96},
+                    {"word": "leaf", "conf": 0.97},
+                ],
+            }
         )
         self.vosk = types.ModuleType("vosk")
         self.vosk.Model = Mock(return_value=object())
@@ -285,6 +307,7 @@ class ListenForQuestionTests(unittest.TestCase):
         question = app.listen_for_question(seconds=8)
 
         self.assertEqual(question, "identify this leaf")
+        self.recognizer.SetWords.assert_called_once_with(True)
         self.sounddevice.rec.assert_called_once_with(
             8 * 44100,
             samplerate=44100,
@@ -306,6 +329,45 @@ class ListenForQuestionTests(unittest.TestCase):
         pcm = np.frombuffer(audio_bytes, dtype="<i2")
         self.assertEqual(pcm.size, 8 * app.VOSK_SAMPLE_RATE)
         self.assertGreater(np.max(np.abs(pcm)), 0)
+
+    def test_returns_low_confidence_flag_from_vosk_word_scores(self):
+        self.recognizer.FinalResult.return_value = json.dumps(
+            {
+                "text": "what kind of bland is this",
+                "result": [
+                    {"word": "what", "conf": 0.95},
+                    {"word": "kind", "conf": 0.91},
+                    {"word": "of", "conf": 0.89},
+                    {"word": "bland", "conf": 0.31},
+                    {"word": "is", "conf": 0.94},
+                    {"word": "this", "conf": 0.96},
+                ],
+            }
+        )
+
+        transcript, low_confidence = app.listen_for_question_with_confidence()
+
+        self.assertEqual(transcript, "what kind of bland is this")
+        self.assertTrue(low_confidence)
+
+    def test_does_not_invent_confidence_when_vosk_omits_word_scores(self):
+        self.recognizer.FinalResult.return_value = json.dumps(
+            {"text": "what kind of plant is this"}
+        )
+
+        transcript, low_confidence = app.listen_for_question_with_confidence()
+
+        self.assertEqual(transcript, "what kind of plant is this")
+        self.assertFalse(low_confidence)
+
+    def test_existing_listener_api_still_returns_only_transcript_text(self):
+        with patch(
+            "app.listen_for_question_with_confidence",
+            return_value=("What kind of plant is this?", True),
+        ):
+            transcript = app.listen_for_question()
+
+        self.assertEqual(transcript, "What kind of plant is this?")
 
     def test_stereo_audio_is_resampled_to_mono_16_bit_pcm(self):
         positions = np.arange(44100, dtype=np.float64)
@@ -384,18 +446,46 @@ class ListenRouteTests(unittest.TestCase):
         self.capture.start()
         self.addCleanup(self.capture.stop)
 
+    def test_voice_page_keeps_transcript_editable_and_manual_submission_available(self):
+        response = self.client.get("/voice")
+
+        self.assertEqual(response.status_code, 200)
+        parser = VoiceInputParser()
+        parser.feed(response.get_data(as_text=True))
+        self.assertIsNotNone(parser.question_input)
+        self.assertNotIn("disabled", parser.question_input)
+        self.assertNotIn("readonly", parser.question_input)
+        self.assertIsNotNone(parser.continue_button)
+
     def test_returns_recognized_transcript(self):
         with patch(
-            "webapp.wildwhisper.listen_for_question",
-            return_value="What kind of tree is this?",
+            "webapp.wildwhisper.listen_for_question_with_confidence",
+            return_value=("What kind of tree is this?", False),
         ):
             response = self.client.post("/api/listen")
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["question"], "What kind of tree is this?")
+        self.assertFalse(response.get_json()["low_confidence"])
+
+    def test_returns_low_confidence_flag_without_exposing_a_score(self):
+        with patch(
+            "webapp.wildwhisper.listen_for_question_with_confidence",
+            return_value=("What kind of bland is this?", True),
+        ):
+            response = self.client.post("/api/listen")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.get_json(),
+            {"question": "What kind of bland is this?", "low_confidence": True},
+        )
 
     def test_does_not_return_an_empty_transcript(self):
-        with patch("webapp.wildwhisper.listen_for_question", return_value=" "):
+        with patch(
+            "webapp.wildwhisper.listen_for_question_with_confidence",
+            return_value=(" ", False),
+        ):
             response = self.client.post("/api/listen")
 
         self.assertEqual(response.status_code, 400)
@@ -403,7 +493,7 @@ class ListenRouteTests(unittest.TestCase):
 
     def test_microphone_permission_error_has_a_clear_message(self):
         with patch(
-            "webapp.wildwhisper.listen_for_question",
+            "webapp.wildwhisper.listen_for_question_with_confidence",
             side_effect=RuntimeError("Microphone permission was denied."),
         ):
             response = self.client.post("/api/listen")
@@ -413,7 +503,7 @@ class ListenRouteTests(unittest.TestCase):
 
     def test_quiet_microphone_audio_has_a_retry_message(self):
         with patch(
-            "webapp.wildwhisper.listen_for_question",
+            "webapp.wildwhisper.listen_for_question_with_confidence",
             side_effect=RuntimeError(
                 "The microphone input was too quiet. Check the input level and try again."
             ),
@@ -425,7 +515,7 @@ class ListenRouteTests(unittest.TestCase):
 
     def test_recognition_failure_has_a_clear_message(self):
         with patch(
-            "webapp.wildwhisper.listen_for_question",
+            "webapp.wildwhisper.listen_for_question_with_confidence",
             side_effect=RuntimeError("Local speech recognition failed"),
         ):
             response = self.client.post("/api/listen")
